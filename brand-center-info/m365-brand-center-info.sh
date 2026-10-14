@@ -6,6 +6,7 @@
 #   • Tenant-Grunddaten
 #   • Brand Center (Site-URL, Feature-Status, Markenfarben, Schriften für SharePoint/Viva, Themes)
 #   • Office-Schriften (OfficeFontLibrary) und Office-Vorlagen (OfficeTemplateLibrary)
+#   • Brand Kits für Clipchamp (BrandKitLibrary)
 #   • OAL (Org Asset Library): Bilder-Libraries, Asset-Typ, CDN-Typ, Dateianzahl
 #   • CDN Config (Public & Private): Status, Origins, Policies
 #
@@ -141,13 +142,17 @@ jq_file() { # label name jq-Argumente...
 count_lines() { if [ -z "$1" ]; then echo 0; else printf '%s\n' "$1" | wc -l | tr -d ' '; fi; }
 
 if [ -t 2 ]; then printf 'Lade Daten von Microsoft 365 ...' >&2; fi
-run_fetch tenant  tenant info get
+# Die CLI holt Token je Ressource (Graph, SharePoint-Site, SharePoint-Admin). Je ein Abruf pro Ressource
+# läuft zuerst nacheinander und füllt den Token-Cache; sonst fordern parallele Prozesse gleichzeitig
+# Token an und öffnen jeweils ein eigenes Anmeldefenster.
+fetch tenant  tenant info get
+fetch bc_settings spo brandcenter settings list
+fetch "cdn_Public" spo cdn get --type Public
 run_fetch oal     spo orgassetslibrary list
-run_fetch bc_settings spo brandcenter settings list
 run_fetch bc_colors   spo brandcenter colors list
 for T in Public Private; do
   run_fetch "orig_$T" spo cdn origin list --type "$T"
-  run_fetch "cdn_$T"  spo cdn get --type "$T"
+  [ "$T" = Public ] || run_fetch "cdn_$T" spo cdn get --type "$T"
   run_fetch "pol_$T"  spo cdn policy list --cdnType "$T"
 done
 wait
@@ -255,7 +260,8 @@ FONT_COUNT=$(count_lines "$FONT_ROWS")
 # jq-Definitionen: Größe in MB (zwei Nachkommastellen, Komma) und Datum deutsch in lokaler Zeit
 JQ_FMT_DEFS='
   def mb: (. * 100 / 1048576 | round) as $c
-    | "\($c / 100 | floor),\($c % 100 | tostring | if length < 2 then "0" + . else . end)";
+    | if $c == 0 and . > 0 then "< 0,01"
+      else "\($c / 100 | floor),\($c % 100 | tostring | if length < 2 then "0" + . else . end)" end;
   def de: sub("\\.[0-9]+"; "") | try (fromdateiso8601 | strflocaltime("%d.%m.%Y %H:%M")) catch .;
 '
 
@@ -323,10 +329,28 @@ fi
 # Dateien in Libraries vom Typ 2 (OfficeTemplateLibrary: Auflistung) und
 # Typ 1 (ImageDocumentLibrary: nur Anzahl)
 TPL_LIB_COUNT=0; TPL_COUNT=0; TPL_LIB_OK=(); TPL_FILE_ROWS=(); IMG_ROWS=""; ASSET_LIB_ROWS=""
+# Typ 16 (BrandKitLibrary: Brand Kits für Clipchamp): jedes Brand Kit ist ein Ordner der ersten Ebene
+BK_LIB_COUNT=0; BK_COUNT=0; BK_LIB_OK=(); BK_KIT_ROWS=()
+asset_kit_names() { # Name Abruf-Nr. Bibliotheks-URL -> Namen der Ordner der ersten Ebene (nur Ordner mit Inhalt)
+  jq_file "Dateien in '$1'" "al_$2" -r --arg base "/${3#/}/" '
+    [ (if type == "array" then . else [] end)[]
+      | select(.ServerRelativeUrl | test("/Forms/") | not)
+      | .ServerRelativeUrl | ltrimstr($base) | split("/") | select(length > 1) | .[0] ]
+    | unique[]'
+}
+asset_file_rows() { # Name Abruf-Nr. Bibliotheks-URL -> Zeilen: Pfad, Größe (MB), Geändert
+  jq_file "Dateien in '$1'" "al_$2" -r --arg base "/${3#/}/" "$JQ_FMT_DEFS"'
+    def nz: if . == null or . == "" then "-" else tostring end;
+    (if type == "array" then . else [] end) | sort_by(.ServerRelativeUrl)[]
+    | select(.ServerRelativeUrl | test("/Forms/") | not)
+    | [ (.ServerRelativeUrl | ltrimstr($base) | nz),
+        (try (.Length | tonumber | mb) catch "-"),
+        ((.TimeLastModified // "-") | de) ] | @tsv'
+}
 if [ "$BC_OK" = true ]; then
   ASSET_LIB_ROWS=$(jq_file "Asset-Libraries" bc_settings -r '
     .OrgAssets.OrgAssetsLibraries.OrgAssetsLibraries[]?
-    | select(.OrgAssetType == 1 or .OrgAssetType == 2)
+    | select(.OrgAssetType == 1 or .OrgAssetType == 2 or .OrgAssetType == 16)
     | [ (.OrgAssetType | tostring),
         (if (.DisplayName // "") == "" then "-" else .DisplayName end),
         (.LibraryUrl | if type == "object" then .DecodedUrl else . end | if . == null or . == "" then "-" else . end) ]
@@ -349,19 +373,21 @@ if [ -n "$ASSET_LIB_ROWS" ]; then
       ti=$TPL_LIB_COUNT
       TPL_LIB_COUNT=$((TPL_LIB_COUNT + 1))
       TPL_LIB_OK[ti]=false; TPL_FILE_ROWS[ti]=""
+    elif [ "$atype" = 16 ]; then
+      bi=$BK_LIB_COUNT
+      BK_LIB_COUNT=$((BK_LIB_COUNT + 1))
+      BK_LIB_OK[bi]=false; BK_KIT_ROWS[bi]=""
     fi
     [ "$aurl" != "-" ] || continue
     if ! f_ok "al_$i"; then fetch_failed "Dateien in '$aname'" "al_$i"; continue; fi
     if [ "$atype" = 2 ]; then
       TPL_LIB_OK[ti]=true
-      TPL_FILE_ROWS[ti]=$(jq_file "Dateien in '$aname'" "al_$i" -r --arg base "/${aurl#/}/" "$JQ_FMT_DEFS"'
-        def nz: if . == null or . == "" then "-" else tostring end;
-        (if type == "array" then . else [] end)[]
-        | select(.ServerRelativeUrl | test("/Forms/") | not)
-        | [ (.ServerRelativeUrl | ltrimstr($base) | nz),
-            (try (.Length | tonumber | mb) catch "-"),
-            ((.TimeLastModified // "-") | de) ] | @tsv')
+      TPL_FILE_ROWS[ti]=$(asset_file_rows "$aname" "$i" "$aurl")
       TPL_COUNT=$((TPL_COUNT + $(count_lines "${TPL_FILE_ROWS[ti]}")))
+    elif [ "$atype" = 16 ]; then
+      BK_LIB_OK[bi]=true
+      BK_KIT_ROWS[bi]=$(asset_kit_names "$aname" "$i" "$aurl")
+      BK_COUNT=$((BK_COUNT + $(count_lines "${BK_KIT_ROWS[bi]}")))
     else
       cnt=$(jq_file "Dateien in '$aname'" "al_$i" -r '
         [ (if type == "array" then . else [] end)[] | select(.ServerRelativeUrl | test("/Forms/") | not) ] | length')
@@ -481,6 +507,8 @@ if [ "$BC_OK" = true ]; then
   for ((i = 0; i < OF_LIB_COUNT; i++)); do OF_OAL_ROWS[i]=$(bc_oal_row 4 "$i"); done
   TPL_OAL_ROWS=()
   for ((i = 0; i < TPL_LIB_COUNT; i++)); do TPL_OAL_ROWS[i]=$(bc_oal_row 2 "$i"); done
+  BK_OAL_ROWS=()
+  for ((i = 0; i < BK_LIB_COUNT; i++)); do BK_OAL_ROWS[i]=$(bc_oal_row 16 "$i"); done
 fi
 
 # Themes: Brand-Center-Endpunkt (liefert die im Brand Center sichtbaren Themes; "spo theme list" bzw. Get-PnPTenantTheme
@@ -722,6 +750,23 @@ render_text() {
     print_warn "Keine Library vom Typ OfficeTemplateLibrary gefunden."
   fi
 
+  print_header "Brand Kits (Clipchamp) – BrandKitLibrary ($(plural "$BK_LIB_COUNT" Library Libraries), $(plural "$BK_COUNT" "Brand Kit" "Brand Kits"))"
+  if [ "$BK_LIB_COUNT" -gt 0 ]; then
+    local bi
+    for ((bi = 0; bi < BK_LIB_COUNT; bi++)); do
+      print_oal_entry "${BK_OAL_ROWS[bi]}"
+      if ! ${BK_LIB_OK[bi]}; then print_error "Dateien der Library konnten nicht abgerufen werden."; continue; fi
+      if [ -n "${BK_KIT_ROWS[bi]}" ]; then
+        echo ""
+        print_table 'Brand Kit' "${BK_KIT_ROWS[bi]}"
+      else
+        print_warn "Keine Brand Kits in der Library vorhanden."
+      fi
+    done
+  else
+    print_warn "Keine Library vom Typ BrandKitLibrary gefunden."
+  fi
+
   print_header "Bilder – ImageDocumentLibrary ($(plural "$IMG_LIB_COUNT" Library Libraries), $(plural "$IMG_TOTAL" Datei Dateien))"
   if [ "$IMG_LIB_COUNT" -gt 0 ]; then
     local irow
@@ -776,6 +821,7 @@ render_text() {
   printf ' %sBilder:%s %s Datei(en) in %s Library(en)\n' "$BOLD" "$RESET" "$IMG_TOTAL" "$IMG_LIB_COUNT"
   printf ' %sOffice-Schriften:%s %s Familie(n), %s Datei(en) in %s Library(en)\n' "$BOLD" "$RESET" "$OF_FAMILY_COUNT" "$OF_FILE_COUNT" "$OF_LIB_COUNT"
   printf ' %sOffice-Vorlagen:%s %s in %s Library(en)\n' "$BOLD" "$RESET" "$TPL_COUNT" "$TPL_LIB_COUNT"
+  printf ' %sBrand Kits (Clipchamp):%s %s in %s Library(en)\n' "$BOLD" "$RESET" "$BK_COUNT" "$BK_LIB_COUNT"
   printf ' %sOAL (gesamt):%s %s Library(en)\n' "$BOLD" "$RESET" "$LIB_COUNT"
   for T in Public Private; do
     st=$(cdn_var CDN_STATUS "$T")
@@ -1017,6 +1063,27 @@ EOF
     done
   else
     printf '<div class="empty">Keine Library vom Typ OfficeTemplateLibrary gefunden.</div>'
+  fi
+  printf '</div></div>\n'
+
+  printf '<div class="card"><h2>Brand Kits (Clipchamp) – BrandKitLibrary (%s, %s)</h2><div class="body">' "$(plural "$BK_LIB_COUNT" Library Libraries)" "$(plural "$BK_COUNT" "Brand Kit" "Brand Kits")"
+  if [ "$BK_LIB_COUNT" -gt 0 ]; then
+    local bi bkit
+    for ((bi = 0; bi < BK_LIB_COUNT; bi++)); do
+      html_oal_entry "${BK_OAL_ROWS[bi]}"
+      if ! ${BK_LIB_OK[bi]}; then printf '<div class="empty">Dateien der Library nicht abrufbar.</div>'; continue; fi
+      if [ -n "${BK_KIT_ROWS[bi]}" ]; then
+        printf '<table><thead><tr><th>Brand Kit</th></tr></thead><tbody>'
+        while IFS= read -r bkit; do
+          printf '<tr><td>%s</td></tr>' "$(h "$bkit")"
+        done <<<"${BK_KIT_ROWS[bi]}"
+        printf '</tbody></table>'
+      else
+        printf '<div class="empty">Keine Brand Kits in der Library vorhanden.</div>'
+      fi
+    done
+  else
+    printf '<div class="empty">Keine Library vom Typ BrandKitLibrary gefunden.</div>'
   fi
   printf '</div></div>\n'
 

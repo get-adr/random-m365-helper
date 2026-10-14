@@ -6,6 +6,7 @@
 #   • Tenant-Grunddaten
 #   • Brand Center (Site-URL, Feature-Status, Markenfarben, Schriften für SharePoint/Viva, Themes)
 #   • Office-Schriften (OfficeFontLibrary) und Office-Vorlagen (OfficeTemplateLibrary)
+#   • Brand Kits für Clipchamp (BrandKitLibrary)
 #   • OAL (Org Asset Library): Bilder-Libraries, Asset-Typ, CDN-Typ, Dateianzahl
 #   • CDN Config (Public & Private): Status, Origins, Policies
 #
@@ -136,7 +137,11 @@ function Get-OrDash {
 $script:DeCulture = [Globalization.CultureInfo]::GetCultureInfo("de-DE")
 function Format-SizeMb {
   param($Bytes)
-  try { return ([double]"$Bytes" / 1MB).ToString("N2", $script:DeCulture) } catch { return "-" }
+  try {
+    $mb = [double]"$Bytes" / 1MB
+    if (($mb -gt 0) -and ([Math]::Round($mb, 2) -eq 0)) { return "< 0,01" }
+    return $mb.ToString("N2", $script:DeCulture)
+  } catch { return "-" }
 }
 function Format-DeDate {
   param($Iso)
@@ -388,11 +393,12 @@ if ($bcOk) {
 # Dateien je Asset-Library: Typ 4 (Office-Schriften + Katalog), Typ 2 (Vorlagen), Typ 1 (nur Anzahl)
 $ofLibs = @()
 $tplLibs = @()
+$bkLibs = @()      # BrandKitLibrary (Brand Kits für Clipchamp)
 $fileCounts = @{}
 if ($bcOk -and $bcConn) {
   foreach ($l in $bcLibs) {
     $type = "$(Get-PropValue $l 'OrgAssetType')"
-    if ($type -notin @("ImageDocumentLibrary", "OfficeTemplateLibrary", "OfficeFontLibrary")) { continue }
+    if ($type -notin @("ImageDocumentLibrary", "OfficeTemplateLibrary", "OfficeFontLibrary", "BrandKitLibrary")) { continue }
     $name = Get-OrDash (Get-PropValue $l 'DisplayName')
     $libUrl = Get-UrlText (Get-PropValue $l 'LibraryUrl')
     $listId = Get-PropValue $l 'ListId'
@@ -402,6 +408,9 @@ if ($bcOk -and $bcConn) {
       Add-StepErr "Dateien in '$name'" $_
       if ($type -eq "OfficeTemplateLibrary") {
         $tplLibs += [pscustomobject]@{ Oal = $null; FilesOk = $false; Files = @() }
+      }
+      if ($type -eq "BrandKitLibrary") {
+        $bkLibs += [pscustomobject]@{ Oal = $null; FilesOk = $false; Kits = @() }
       }
       if ($type -eq "OfficeFontLibrary") {
         $ofLibs += [pscustomobject]@{ Oal = $null; FilesOk = $false; Files = @(); CatalogPath = ""; Families = @() }
@@ -421,7 +430,16 @@ if ($bcOk -and $bcConn) {
           $rel = if ($f.Path.StartsWith($base, [StringComparison]::OrdinalIgnoreCase)) { $f.Path.Substring($base.Length) } else { $f.Path }
           $tplFilesOfLib += [pscustomobject]@{ File = $rel; SizeMb = Format-SizeMb $f.Size; Modified = Format-DeDate $f.Modified }
         }
-        $tplLibs += [pscustomobject]@{ Oal = $null; FilesOk = $true; Files = $tplFilesOfLib }
+        $tplLibs += [pscustomobject]@{ Oal = $null; FilesOk = $true; Files = @($tplFilesOfLib | Sort-Object File) }
+      }
+      "BrandKitLibrary" {
+        # Mehrere Libraries dieses Typs möglich: je Library ein Eintrag
+        # Jedes Brand Kit ist ein Ordner der ersten Ebene (nur Ordner mit Inhalt)
+        $bkNames = @($realFiles | ForEach-Object {
+          $rel = if ($_.Path.StartsWith($base, [StringComparison]::OrdinalIgnoreCase)) { $_.Path.Substring($base.Length) } else { $_.Path }
+          if ($rel.Contains('/')) { $rel.Split('/')[0] }
+        } | Sort-Object -Unique)
+        $bkLibs += [pscustomobject]@{ Oal = $null; FilesOk = $true; Kits = $bkNames }
       }
       "OfficeFontLibrary" {
         # Mehrere Libraries dieses Typs möglich: je Library ein Eintrag
@@ -467,6 +485,7 @@ if ($bcOk -and $bcConn) {
   }
 }
 
+$bkKitCount = @($bkLibs | ForEach-Object { $_.Kits }).Count
 $tplFileCount = @($tplLibs | ForEach-Object { $_.Files }).Count
 $ofFamilyCount = @($ofLibs | ForEach-Object { $_.Families }).Count
 $ofFileCount = @($ofLibs | ForEach-Object { $_.Files }).Count
@@ -564,6 +583,7 @@ $bcOalFonts  = Get-BrandCenterOalRow "BrandFontsLibrary"
 # OAL-Einträge der Office-Schriften-Libraries (gleiche Reihenfolge wie bei der Datensammlung)
 for ($i = 0; $i -lt @($ofLibs).Count; $i++) { $ofLibs[$i].Oal = Get-BrandCenterOalRow "OfficeFontLibrary" $i }
 for ($i = 0; $i -lt @($tplLibs).Count; $i++) { $tplLibs[$i].Oal = Get-BrandCenterOalRow "OfficeTemplateLibrary" $i }
+for ($i = 0; $i -lt @($bkLibs).Count; $i++) { $bkLibs[$i].Oal = Get-BrandCenterOalRow "BrandKitLibrary" $i }
 
 # Nur Bilder-Libraries (ImageDocumentLibrary): Office-Schriften und -Vorlagen haben eigene Abschnitte
 $imgRows = @($libRows | Where-Object { $_.Type -match 'ImageDocumentLibrary' })
@@ -759,6 +779,18 @@ function render_text {
     }
   } else { print_warn "Keine Library vom Typ OfficeTemplateLibrary gefunden." }
 
+  print_header "Brand Kits (Clipchamp) – BrandKitLibrary ($(Get-Plural (@($bkLibs).Count) Library Libraries), $(Get-Plural $bkKitCount "Brand Kit" "Brand Kits"))"
+  if (@($bkLibs).Count) {
+    foreach ($lib in $bkLibs) {
+      print_oal_entry $lib.Oal
+      if (-not $lib.FilesOk) { print_error "Dateien der Library konnten nicht abgerufen werden."; continue }
+      if (@($lib.Kits).Count) {
+        Write-Host ""
+        print_table @("Brand Kit") @($lib.Kits | ForEach-Object { ,@($_) })
+      } else { print_warn "Keine Brand Kits in der Library vorhanden." }
+    }
+  } else { print_warn "Keine Library vom Typ BrandKitLibrary gefunden." }
+
   print_header "Bilder – ImageDocumentLibrary ($(Get-Plural (@($imgRows).Count) Library Libraries), $(Get-Plural $imageTotal Datei Dateien))"
   if ($imgRows.Count) {
     foreach ($r in $imgRows) { print_oal_entry $r }
@@ -794,6 +826,7 @@ function render_text {
   Write-Host " ${BOLD}Bilder:${RESET} $imageTotal Datei(en) in $($imgRows.Count) Library(en)"
   Write-Host " ${BOLD}Office-Schriften:${RESET} $ofFamilyCount Familie(n), $ofFileCount Datei(en) in $(@($ofLibs).Count) Library(en)"
   Write-Host " ${BOLD}Office-Vorlagen:${RESET} $tplFileCount in $(@($tplLibs).Count) Library(en)"
+  Write-Host " ${BOLD}Brand Kits (Clipchamp):${RESET} $bkKitCount in $(@($bkLibs).Count) Library(en)"
   Write-Host " ${BOLD}OAL (gesamt):${RESET} $($libRows.Count) Library(en)"
   foreach ($t in @("Public", "Private")) {
     $c = switch ($cdn[$t].Status) { "on" { $GREEN } "off" { $YELLOW } default { $RED } }
@@ -960,6 +993,21 @@ footer{ text-align:center; color:var(--muted); font-size:.82rem; padding:24px 16
       } else { A "<div class=`"empty`">Keine Vorlagen in der Library vorhanden.</div>" }
     }
   } else { A "<div class=`"empty`">Keine Library vom Typ OfficeTemplateLibrary gefunden.</div>" }
+  A "</div></div>"
+
+  # Brand Kits (Clipchamp)
+  A "<div class=`"card`"><h2>Brand Kits (Clipchamp) – BrandKitLibrary ($(Get-Plural (@($bkLibs).Count) Library Libraries), $(Get-Plural $bkKitCount "Brand Kit" "Brand Kits"))</h2><div class=`"body`">"
+  if (@($bkLibs).Count) {
+    foreach ($lib in $bkLibs) {
+      Add-OalEntry $lib.Oal
+      if (-not $lib.FilesOk) { A "<div class=`"empty`">Dateien der Library nicht abrufbar.</div>"; continue }
+      if (@($lib.Kits).Count) {
+        A "<table><thead><tr><th>Brand Kit</th></tr></thead><tbody>"
+        foreach ($k in $lib.Kits) { A "<tr><td>$(Esc $k)</td></tr>" }
+        A "</tbody></table>"
+      } else { A "<div class=`"empty`">Keine Brand Kits in der Library vorhanden.</div>" }
+    }
+  } else { A "<div class=`"empty`">Keine Library vom Typ BrandKitLibrary gefunden.</div>" }
   A "</div></div>"
 
   # OAL
